@@ -1,0 +1,5 @@
+# Sources are submodules; build output never enters git — it goes to GitHub Releases.
+/.deps*
+/out/
+*.o
+*.a

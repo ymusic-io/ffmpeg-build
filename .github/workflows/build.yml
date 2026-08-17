@@ -1,0 +1,231 @@
+name: build
+
+on:
+  push:
+    # FFmpeg's own tag style, e.g. n9.0.1 — tag this repo to match the upstream commit it builds.
+    tags: ['n*', 'v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 is Intel, macos-14 is Apple Silicon.
+          - { name: macos-x86_64,  runner: macos-15-intel, out: ffmpeg }
+          - { name: macos-arm64,   runner: macos-14,      out: ffmpeg }
+          - { name: linux-x86_64,  runner: ubuntu-22.04,  out: ffmpeg }
+          - { name: linux-arm64,   runner: ubuntu-22.04-arm, out: ffmpeg }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build tools (macOS)
+        if: startsWith(matrix.runner, 'macos')
+        run: brew install nasm ccache automake autoconf libtool pkg-config
+
+      - name: Install build tools (Linux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y nasm ccache automake autoconf libtool pkg-config
+
+      - name: Cache ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ startsWith(matrix.runner, 'macos') && '~/Library/Caches/ccache' || '~/.cache/ccache' }}
+          key: ccache-${{ matrix.name }}-${{ hashFiles('.gitmodules', 'scripts/*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.name }}-${{ hashFiles('.gitmodules', 'scripts/*.sh') }}-
+            ccache-${{ matrix.name }}-
+
+      - name: Cache built dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .deps
+          key: deps-${{ matrix.name }}-${{ hashFiles('.gitmodules', 'scripts/common.sh') }}
+
+      - name: Build
+        env:
+          # ffmpeg's configure ignores $CC (cc_default is hardcoded), so ccache goes through --cc.
+          HOST_CC: ccache cc
+        run: scripts/build-desktop.sh out/${{ matrix.name }}/${{ matrix.out }}
+
+      - run: ccache --show-stats | head -5
+
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/${{ matrix.name }}/${{ matrix.out }}
+
+  windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native, not cross-compiled, so CI can also RUN each binary before publishing it.
+          # nasm is x86-only; aarch64 assembly goes through the C compiler.
+          - { name: windows-x86_64, runner: windows-latest, msystem: MINGW64,
+              pacboy: 'toolchain:p nasm:p pkg-config:p ccache:p', cc: gcc }
+          - { name: windows-arm64,  runner: windows-11-arm, msystem: CLANGARM64,
+              pacboy: 'toolchain:p pkg-config:p ccache:p', cc: clang }
+    defaults:
+      run:
+        # ffmpeg's configure is a shell script, and MSYS2 provides the shell.
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          # pacboy's :p suffix expands to the environment's package prefix, so one line covers
+          # both mingw-w64-x86_64- and mingw-w64-clang-aarch64-.
+          pacboy: ${{ matrix.pacboy }}
+          install: base-devel git autoconf automake libtool
+      - name: Cache ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.name }}-${{ hashFiles('.gitmodules', 'scripts/*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.name }}-${{ hashFiles('.gitmodules', 'scripts/*.sh') }}-
+            ccache-${{ matrix.name }}-
+      - name: Cache built dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .deps
+          key: deps-${{ matrix.name }}-${{ hashFiles('.gitmodules', 'scripts/common.sh') }}
+      - name: Build
+        env:
+          HOST_CC: ccache ${{ matrix.cc }}
+        run: scripts/build-desktop.sh out/${{ matrix.name }}/ffmpeg.exe
+      - run: ccache --show-stats | head -5
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/${{ matrix.name }}/ffmpeg.exe
+
+  android:
+    name: android-${{ matrix.abi }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        id: ndk
+        with:
+          ndk-version: r27c
+      - run: sudo apt-get update && sudo apt-get install -y nasm automake autoconf libtool pkg-config
+      # No ccache: build-android.sh sets CC to an NDK binary itself.
+      - name: Cache built dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .deps-android-${{ matrix.abi }}
+          key: deps-android-${{ matrix.abi }}-${{ hashFiles('.gitmodules', 'scripts/common.sh') }}
+      - run: scripts/build-android.sh ${{ matrix.abi }} out/android-${{ matrix.abi }}/libffmpeg.so
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: out/android-${{ matrix.abi }}/libffmpeg.so
+
+  release:
+    # Signing secrets live on this environment; add required reviewers to gate releases.
+    if: github.ref_type == 'tag'
+    needs: [desktop, windows, android]
+    environment: release
+    permissions:
+      contents: write
+    # codesign is macOS-only; it signs both macOS binaries from here.
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      - name: Collect and name the binaries
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for d in artifacts/*/; do
+            name="$(basename "$d")"
+            src="$(find "$d" -type f | head -1)"
+            ext=""; case "$src" in *.exe) ext=".exe";; *.so) ext=".so";; esac
+            cp "$src" "release/ffmpeg-$name$ext"
+          done
+          ls -l release
+
+      #   MACOS_CERT_P12       Developer ID .p12, base64:  base64 -i cert.p12 | pbcopy
+      #   MACOS_CERT_PASSWORD  its export password
+      - name: Sign the macOS binaries
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERT="$RUNNER_TEMP/cert.p12"
+
+          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Without this the keychain relocks mid-job and codesign waits on a UI prompt.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # Without this codesign cannot reach the key.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN"
+          rm -f "$CERT"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          test -n "$IDENTITY" || { echo "no Developer ID Application identity in the .p12" >&2; exit 1; }
+          echo "signing as: $IDENTITY"
+
+          for b in release/ffmpeg-macos-*; do
+            # --timestamp keeps the signature valid after the certificate expires.
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" "$b"
+            codesign --verify --strict "$b"
+            codesign --verify -R="anchor apple generic" "$b"
+            echo "  signed $b"
+          done
+
+      - name: Discard the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+
+      # After signing — codesign rewrites the binary.
+      - name: Checksum
+        run: cd release && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: release/*
+          body: |
+            macOS binaries are Developer ID signed with a hardened runtime and a secure timestamp.
+            Windows and Linux are unsigned.
+
+            Licence: LGPL-2.1+ (FFmpeg) with LGPL-2.0+ LAME and Shine linked in. See NOTICE.md.

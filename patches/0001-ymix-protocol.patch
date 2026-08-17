@@ -1,0 +1,433 @@
+ymix: a proxy URL protocol for sandboxed file access
+
+Adds libavformat/ymix.c plus its four registration points. FFmpeg reaches a
+file it may not open directly by talking to a helper over a Unix socket —
+on Android that is the only way to touch a content:// document.
+
+Generated from Khang-NT/FFmpeg; applies to upstream 90cca8111b7db00f33ca0910f599957553a68843.
+---
+diff --git a/configure b/configure
+index 8941ced1f4..47cadf207c 100755
+--- a/configure
++++ b/configure
+@@ -4122,6 +4122,8 @@ udp_protocol_select="network"
+ udplite_protocol_select="network"
+ unix_protocol_deps="sys_un_h"
+ unix_protocol_select="network"
++ymix_protocol_deps="sys_un_h"
++ymix_protocol_select="network"
+ ipfs_gateway_protocol_select="https_protocol"
+ ipns_gateway_protocol_select="https_protocol"
+ 
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 752436cf5f..8948b52ca3 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -731,6 +731,7 @@ OBJS-$(CONFIG_DTLS_PROTOCOL)             += tls.o $(TLS-OBJS-yes)
+ OBJS-$(CONFIG_UDP_PROTOCOL)              += udp.o ip.o
+ OBJS-$(CONFIG_UDPLITE_PROTOCOL)          += udp.o ip.o
+ OBJS-$(CONFIG_UNIX_PROTOCOL)             += unix.o
++OBJS-$(CONFIG_YMIX_PROTOCOL)             += ymix.o
+ 
+ # external library protocols
+ OBJS-$(CONFIG_LIBAMQP_PROTOCOL)          += libamqp.o
+diff --git a/libavformat/protocols.c b/libavformat/protocols.c
+index 257b41970a..8b2d8343b1 100644
+--- a/libavformat/protocols.c
++++ b/libavformat/protocols.c
+@@ -66,6 +66,7 @@ extern const URLProtocol ff_dtls_protocol;
+ extern const URLProtocol ff_udp_protocol;
+ extern const URLProtocol ff_udplite_protocol;
+ extern const URLProtocol ff_unix_protocol;
++extern const URLProtocol ff_ymix_protocol;
+ extern const URLProtocol ff_libamqp_protocol;
+ extern const URLProtocol ff_librist_protocol;
+ extern const URLProtocol ff_librtmp_protocol;
+diff --git a/libavformat/ymix.c b/libavformat/ymix.c
+new file mode 100644
+index 0000000000..4c0bb66143
+--- /dev/null
++++ b/libavformat/ymix.c
+@@ -0,0 +1,382 @@
++/*
++ * ymix: a pull-based unix-domain-socket proxy protocol
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ *
++ * ymix url_protocol.
++ *
++ * A single, strictly-synchronous connection per url_open(). It lets FFmpeg do
++ * random-access read/write against a file it cannot open directly (e.g. an
++ * Android content:// URI behind the Storage Access Framework) by proxying I/O
++ * over a unix-domain socket to a host application ("APP").
++ *
++ * Wire protocol (all control lines are '\n'-terminated ASCII; FFmpeg sends one
++ * request and waits for exactly one reply before sending the next):
++ *
++ *   FF -> APP   start_session read | start_session write   (first frame)
++ *   APP -> FF   ok | error <code>
++ *
++ *   FF -> APP   read <pos> <len>
++ *   APP -> FF   chunk <n>\n<n bytes>        (n <= len; n == 0 means EOF)
++ *             | error <code>
++ *
++ *   FF -> APP   write <pos> <len>\n<len bytes>
++ *   APP -> FF   ok | error <code>           (per-write acknowledgement)
++ *
++ *   FF -> APP   stat
++ *   APP -> FF   stat_ok <size> | error <code>
++ *
++ *   FF -> APP   bye
++ *   APP -> FF   ok | error <code>           (flush/fsync barrier on write)
++ *
++ * An error reply is "error <code>", where <code> is a stable snake_case token
++ * (never free-form text). ymix_map_error() maps each to an AVERROR:
++ *   file_not_found -> ENOENT   permission_denied -> EACCES   no_space -> ENOSPC
++ *   bad_request    -> EINVAL   bad_handshake/unknown_command -> EPROTO
++ *   io_error / anything else   -> EIO
++ *
++ * url_seek is purely local: it updates the cursor, and the new position rides
++ * on the next read/write. SEEK_END / AVSEEK_SIZE issue a stat. There is no seek
++ * frame, no session id, no second connection — so the APP is a simple blocking
++ * loop with no concurrency. A concurrent open of the same socket (e.g. mp4
++ * +faststart, which opens the output a second time read-only) is just another
++ * independent connection.
++ *
++ * URL form: ymix:<socket_path>. A leading '0' selects a Linux abstract socket
++ * (first byte replaced with '\0').
++ */
++
++#include "libavutil/avstring.h"
++#include "libavutil/opt.h"
++#include "os_support.h"
++#include "network.h"
++#include <sys/un.h>
++#include <inttypes.h>
++#include <string.h>
++#include <errno.h>
++#include "url.h"
++
++/* FFmpeg's AVIO buffer is 32 KiB (IO_BUFFER_SIZE), so most requests are this
++ * size anyway. Capping read and write chunks bounds the APP's per-connection
++ * buffer; a short read/write is fine — ffmpeg's retry_transfer_wrapper loops. */
++#define YMIX_MAX_CHUNK (32 * 1024)
++
++typedef struct YmixContext {
++    const AVClass *class;
++    struct sockaddr_un addr;
++    int addr_len;
++    int timeout;        /* connect timeout in ms */
++    int fd;             /* the single connection (-1 when closed) */
++    int reading_mode;   /* 1 = read session, 0 = write session */
++    int64_t pos;        /* logical cursor; sent with every read/write */
++} YmixContext;
++
++#define OFFSET(x) offsetof(YmixContext, x)
++#define ED AV_OPT_FLAG_DECODING_PARAM|AV_OPT_FLAG_ENCODING_PARAM
++static const AVOption ymix_options[] = {
++    { "timeout", "Connect timeout in ms", OFFSET(timeout), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, ED },
++    { NULL }
++};
++
++static const AVClass ymix_class = {
++    .class_name = "ymix",
++    .item_name  = av_default_item_name,
++    .option     = ymix_options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++/* Block until fd is ready, honouring the interrupt callback and h->rw_timeout
++ * (microseconds; 0 == wait forever but stay interruptible). */
++static int ymix_wait(URLContext *h, int fd, int write)
++{
++    return ff_network_wait_fd_timeout(fd, write, h->rw_timeout, &h->interrupt_callback);
++}
++
++/* Send exactly len bytes. */
++static int write_all(URLContext *h, int fd, const char *buf, int len)
++{
++    int written = 0;
++    while (written < len) {
++        int ret = ymix_wait(h, fd, 1);
++        if (ret < 0) return ret;
++        ret = send(fd, &buf[written], len - written, MSG_NOSIGNAL);
++        if (ret == 0) return AVERROR(ENETDOWN); /* peer closed */
++        if (ret < 0) return ff_neterrno();
++        written += ret;
++    }
++    return 0;
++}
++
++/* Read a single '\n'-terminated line into out (always NUL-terminated). */
++static int read_line(URLContext *h, int fd, char *out, int max)
++{
++    int read = 0;
++    while (read < max - 1) {
++        char ch;
++        int ret = ymix_wait(h, fd, 0);
++        if (ret < 0) return ret;
++        ret = recv(fd, &ch, 1, 0);
++        if (ret < 0) return ff_neterrno();
++        if (ret < 1) return AVERROR_EOF;
++        if (ch == '\n')
++            break;
++        out[read++] = ch;
++    }
++    out[read] = '\0';
++    return read;
++}
++
++/* Read exactly len bytes into buf. */
++static int read_all(URLContext *h, int fd, uint8_t *buf, int len)
++{
++    int got = 0;
++    while (got < len) {
++        int ret = ymix_wait(h, fd, 0);
++        if (ret < 0) return ret;
++        ret = recv(fd, buf + got, len - got, 0);
++        if (ret == 0) return AVERROR_EOF; /* peer closed mid-chunk */
++        if (ret < 0) return ff_neterrno();
++        got += ret;
++    }
++    return got;
++}
++
++/* Map an "error <code>" reply from the APP to an AVERROR. The APP sends stable
++ * snake_case tokens (see FfYmixProtocolServer / YmixError on the app side), never
++ * free-form text. An unrecognized code or a non-error reply falls back to EIO. */
++static int ymix_map_error(URLContext *h, const char *rep)
++{
++    const char *code;
++    int err = AVERROR(EIO);
++
++    if (av_strstart(rep, "error ", &code)) {
++        if      (!strcmp(code, "file_not_found"))    err = AVERROR(ENOENT);
++        else if (!strcmp(code, "permission_denied")) err = AVERROR(EACCES);
++        else if (!strcmp(code, "no_space"))          err = AVERROR(ENOSPC);
++        else if (!strcmp(code, "bad_request"))       err = AVERROR(EINVAL);
++        else if (!strcmp(code, "bad_handshake"))     err = AVERROR(EPROTO);
++        else if (!strcmp(code, "unknown_command"))   err = AVERROR(EPROTO);
++        else if (!strcmp(code, "io_error"))          err = AVERROR(EIO);
++        av_log(h, AV_LOG_ERROR, "ymix: server error '%s'\n", code);
++    } else {
++        av_log(h, AV_LOG_ERROR, "ymix: unexpected reply '%s'\n", rep);
++    }
++    return err;
++}
++
++static int ymix_open(URLContext *h, const char *filename, int flags)
++{
++    YmixContext *s = h->priv_data;
++    const char *hello;
++    char rep[256];
++    int fd, ret;
++
++    /* A session is one-directional (read OR write). Reject an ambiguous
++     * read+write open rather than silently behaving as read-only. */
++    if ((flags & AVIO_FLAG_READ) && (flags & AVIO_FLAG_WRITE)) {
++        av_log(h, AV_LOG_ERROR, "ymix does not support read+write mode\n");
++        return AVERROR(EINVAL);
++    }
++
++    s->reading_mode = !!(flags & AVIO_FLAG_READ);
++    s->pos = 0;
++    s->fd = -1;
++
++    av_strstart(filename, "ymix:", &filename);
++    av_log(h, AV_LOG_DEBUG, "Open %s (%s)\n", filename, s->reading_mode ? "read" : "write");
++
++    s->addr.sun_family = AF_UNIX;
++    av_strlcpy(s->addr.sun_path, filename, sizeof(s->addr.sun_path));
++    if (filename[0] == '0') {
++        s->addr.sun_path[0] = '\0';
++        s->addr_len = strlen(filename) + offsetof(struct sockaddr_un, sun_path);
++        av_log(h, AV_LOG_DEBUG, "Abstract domain socket %s\n", &s->addr.sun_path[1]);
++    } else {
++        s->addr_len = sizeof(s->addr);
++    }
++
++    if (s->timeout < 0)
++        s->timeout = 3000;
++
++    if ((fd = ff_socket(AF_UNIX, SOCK_STREAM, 0, h)) < 0)
++        return ff_neterrno();
++    ret = ff_listen_connect(fd, (struct sockaddr *)&s->addr, s->addr_len, s->timeout, h, 0);
++    if (ret < 0) {
++        closesocket(fd);
++        return ret;
++    }
++    ff_socket_nonblock(fd, 0);
++
++    /* Handshake. */
++    hello = s->reading_mode ? "start_session read\n" : "start_session write\n";
++    if ((ret = write_all(h, fd, hello, strlen(hello))) < 0)
++        goto fail;
++    if ((ret = read_line(h, fd, rep, sizeof(rep))) < 0)
++        goto fail;
++    if (strcmp(rep, "ok") != 0) {
++        ret = ymix_map_error(h, rep);
++        goto fail;
++    }
++
++    s->fd = fd;
++    h->is_streamed = 0;
++    return 0;
++
++fail:
++    closesocket(fd);
++    return ret;
++}
++
++static int ymix_read(URLContext *h, uint8_t *buf, int size)
++{
++    YmixContext *s = h->priv_data;
++    char cmd[64], rep[256];
++    int want, n, ret;
++
++    if (!s->reading_mode) {
++        av_log(h, AV_LOG_ERROR, "read on a write session\n");
++        return AVERROR(EPERM);
++    }
++
++    want = size < YMIX_MAX_CHUNK ? size : YMIX_MAX_CHUNK;
++    snprintf(cmd, sizeof(cmd), "read %" PRId64 " %d\n", s->pos, want);
++    if ((ret = write_all(h, s->fd, cmd, strlen(cmd))) < 0)
++        return ret;
++
++    if ((ret = read_line(h, s->fd, rep, sizeof(rep))) < 0)
++        return ret;
++    if (sscanf(rep, "chunk %d", &n) != 1) {
++        return ymix_map_error(h, rep);
++    }
++    if (n < 0 || n > want) {
++        av_log(h, AV_LOG_ERROR, "chunk size %d out of range (want %d)\n", n, want);
++        return AVERROR(EIO);
++    }
++    if (n == 0)
++        return AVERROR_EOF;
++
++    if ((ret = read_all(h, s->fd, buf, n)) < 0)
++        return ret;
++    s->pos += n;
++    return n;
++}
++
++static int ymix_write(URLContext *h, const uint8_t *buf, int size)
++{
++    YmixContext *s = h->priv_data;
++    char cmd[64], rep[256];
++    int n, ret;
++
++    if (s->reading_mode) {
++        av_log(h, AV_LOG_ERROR, "write on a read session\n");
++        return AVERROR(EPERM);
++    }
++
++    n = size < YMIX_MAX_CHUNK ? size : YMIX_MAX_CHUNK;
++    snprintf(cmd, sizeof(cmd), "write %" PRId64 " %d\n", s->pos, n);
++    if ((ret = write_all(h, s->fd, cmd, strlen(cmd))) < 0)
++        return ret;
++    if ((ret = write_all(h, s->fd, (const char *)buf, n)) < 0)
++        return ret;
++
++    if ((ret = read_line(h, s->fd, rep, sizeof(rep))) < 0)
++        return ret;
++    if (strcmp(rep, "ok") != 0) {
++        return ymix_map_error(h, rep);
++    }
++    s->pos += n;
++    return n;
++}
++
++static int64_t ymix_seek(URLContext *h, int64_t pos, int whence)
++{
++    YmixContext *s = h->priv_data;
++    int64_t size = -1, newpos;
++    int ret;
++
++    if (whence == AVSEEK_SIZE || whence == SEEK_END) {
++        char rep[256];
++        if ((ret = write_all(h, s->fd, "stat\n", 5)) < 0)
++            return ret;
++        if ((ret = read_line(h, s->fd, rep, sizeof(rep))) < 0)
++            return ret;
++        if (sscanf(rep, "stat_ok %" SCNd64, &size) != 1 || size < 0) {
++            return ymix_map_error(h, rep);
++        }
++    }
++
++    if (whence == AVSEEK_SIZE)
++        return size;
++
++    switch (whence) {
++    case SEEK_SET: newpos = pos;          break;
++    case SEEK_CUR: newpos = s->pos + pos; break;
++    case SEEK_END: newpos = size + pos;   break;
++    default:
++        av_log(h, AV_LOG_ERROR, "invalid whence %d\n", whence);
++        return AVERROR(EINVAL);
++    }
++    if (newpos < 0)
++        return AVERROR(EINVAL);
++
++    s->pos = newpos;
++    return newpos;
++}
++
++static int ymix_close(URLContext *h)
++{
++    YmixContext *s = h->priv_data;
++    int ret = 0;
++
++    if (s->fd < 0)
++        return 0;
++
++    /* Graceful close: bye -> ok. For a write session this is the flush/fsync
++     * durability barrier, so a late write error surfaces from url_close. */
++    if (write_all(h, s->fd, "bye\n", 4) >= 0) {
++        char rep[256];
++        if (read_line(h, s->fd, rep, sizeof(rep)) >= 0 && strcmp(rep, "ok") != 0)
++            ret = ymix_map_error(h, rep);
++    }
++
++    closesocket(s->fd);
++    s->fd = -1;
++    return ret;
++}
++
++static int ymix_get_file_handle(URLContext *h)
++{
++    YmixContext *s = h->priv_data;
++    return s->fd;
++}
++
++const URLProtocol ff_ymix_protocol = {
++    .name                = "ymix",
++    .url_open            = ymix_open,
++    .url_read            = ymix_read,
++    .url_write           = ymix_write,
++    .url_seek            = ymix_seek,
++    .url_close           = ymix_close,
++    .url_get_file_handle = ymix_get_file_handle,
++    .priv_data_size      = sizeof(YmixContext),
++    .priv_data_class     = &ymix_class,
++    .flags               = URL_PROTOCOL_FLAG_NETWORK
++};

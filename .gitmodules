@@ -1,0 +1,12 @@
+[submodule "src/ffmpeg"]
+	path = src/ffmpeg
+	url = https://github.com/FFmpeg/FFmpeg.git
+	shallow = true
+[submodule "src/lame"]
+	path = src/lame
+	url = https://github.com/tanersener/lame.git
+	shallow = true
+[submodule "src/shine"]
+	path = src/shine
+	url = https://github.com/toots/shine.git
+	shallow = true
