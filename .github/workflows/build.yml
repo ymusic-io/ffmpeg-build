@@ -189,20 +189,45 @@ jobs:
           CERT="$RUNNER_TEMP/cert.p12"
 
           echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+          # Named here, rather than reaching `security import` as an unexplained failure.
+          [ -s "$CERT" ] || { echo "MACOS_CERT_P12 is empty or is not base64" >&2; exit 1; }
+          echo "certificate blob: $(wc -c < "$CERT" | tr -d ' ') bytes"
+
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           # Without this the keychain relocks mid-job and codesign waits on a UI prompt.
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$CERT" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # A wrong password fails here loudly, on its own. A .p12 exported from Keychain Access's
+          # "Keys" category does not: it holds the private key alone, imports silently with status
+          # 0, and would otherwise surface twenty lines later as an unexplained empty identity list.
+          security import "$CERT" -P "$MACOS_CERT_PASSWORD" -A -f pkcs12 -k "$KEYCHAIN"
+          if [ "$(security find-certificate -a "$KEYCHAIN" 2>/dev/null | grep -c '^keychain:')" -lt 1 ]; then
+            echo "the .p12 holds a private key but no certificate. Re-export the identity from" >&2
+            echo "Keychain Access under \"My Certificates\", not under \"Keys\"." >&2
+            exit 1
+          fi
           # Without this codesign cannot reach the key.
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          security list-keychain -d user -s "$KEYCHAIN"
+          # Appended, not substituted. Trust evaluation walks the search list to build the chain,
+          # so replacing it hides the Apple intermediates the runner image already carries — and an
+          # identity whose chain does not build is not a *valid* one, which is what is matched below.
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d ' "')
           rm -f "$CERT"
 
+          echo "identities in the signing keychain:"
+          security find-identity -p codesigning "$KEYCHAIN" | sed 's/^/  /'
+
+          # sed, not grep: under `set -o pipefail` a non-matching grep aborts the step on this very
+          # assignment, so the diagnosis below never prints and the job fails with no reason given.
           IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
-            | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
-          test -n "$IDENTITY" || { echo "no Developer ID Application identity in the .p12" >&2; exit 1; }
+            | sed -n '/Developer ID Application/{s/.*"\(.*\)".*/\1/p;q;}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "no VALID Developer ID Application identity. From the listing above:" >&2
+            echo "  listed, but not valid -> the .p12 is missing its intermediate certificate" >&2
+            echo "  not listed at all     -> wrong MACOS_CERT_PASSWORD, or not a Developer ID .p12" >&2
+            exit 1
+          fi
           echo "signing as: $IDENTITY"
 
           for b in release/ffmpeg-macos-*; do

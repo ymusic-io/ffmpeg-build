@@ -3,3 +3,8 @@
 /out/
 *.o
 *.a
+
+# Signing material never belongs here — it lives in the release environment's secrets.
+*.p12
+*.cer
+*.keychain-db
