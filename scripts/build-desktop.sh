@@ -62,6 +62,12 @@ esac
 BIN="${BIN:-ffmpeg}"
 
 DEP_CFLAGS="$DEP_STD $FF_OPTFLAGS $FF_SIZE_CFLAGS $MIN_OS"
+# Desktop links these static deps into shared libav. macOS objects are PIC by
+# default; Linux and mingw are not, and libmp3lame.a then fails the DSO link
+# (R_X86_64_PC32 against stderr).
+case "$(uname -s)" in
+  Linux|MINGW*|MSYS*|CLANG*|UCRT*) DEP_CFLAGS="$DEP_CFLAGS -fPIC" ;;
+esac
 
 # Build a vendored autotools dependency in a disposable copy, so src/ stays pristine while still
 # building in-tree (shine's CLI includes a sibling header by relative path and breaks under VPATH).
@@ -151,6 +157,16 @@ pack_ffmpeg_shared "$PACK" "$PREFIX" "$BIN" "$ALLOWED_DEPS"
 cp -a "$PACK"/libav* "$PACK"/libsw* "$PREFIX/lib/" 2>/dev/null || true
 if [ -n "${WINDOWS:-}" ]; then
   cp -a "$PACK"/av*.dll "$PACK"/sw*.dll "$PREFIX/bin/" 2>/dev/null || true
+fi
+
+# make expands $ORIGIN in config.mak ($O is empty), so the linked runpath is the
+# literal "RIGIN" and the CLI cannot load the libav DSOs beside it. Stamp $ORIGIN.
+if [ "$(uname -s)" = Linux ]; then
+  command -v patchelf >/dev/null 2>&1 || { echo "FATAL: patchelf is required so the pack runs with an empty env" >&2; exit 1; }
+  while IFS= read -r -d '' elf; do
+    file -b "$elf" | grep -q ELF || continue
+    patchelf --set-rpath '$ORIGIN' "$elf" || { echo "FATAL: patchelf failed on $elf" >&2; exit 1; }
+  done < <(find "$PACK" -type f ! -type l -print0)
 fi
 
 echo "[verify]"
