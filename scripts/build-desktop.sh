@@ -51,7 +51,11 @@ case "$(uname -s)" in
     EXTRA_LDFLAGS="-static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
     EXTRA_CONF="--target-os=mingw64 --host-os=mingw64"
     # Case-insensitively matched; OS DLLs plus our libav/libsw.
-    ALLOWED_DEPS='^(kernel32|user32|advapi32|ws2_32|shell32|ole32|oleaut32|secur32|bcrypt|ncrypt|crypt32|gdi32|imm32|version|psapi|iphlpapi|winmm|shlwapi|msvcrt|ucrtbase|api-ms-|avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample)'
+    # zlib1 is MinGW's shared zlib (ffmpeg --enable-zlib picks it up); ship it beside ffmpeg.exe.
+    # libwinpthread-1 similarly — ffmpeg's own `--extra-ldflags "-Bstatic -lwinpthread -Bdynamic"`
+    # sandwich doesn't survive ffmpeg's internal reordering for the per-lib .so links, so each DSO
+    # ends up linking the shared one; ship it too.
+    ALLOWED_DEPS='^(kernel32|user32|advapi32|ws2_32|shell32|ole32|oleaut32|secur32|bcrypt|ncrypt|crypt32|gdi32|imm32|version|psapi|iphlpapi|winmm|shlwapi|msvcrt|ucrtbase|api-ms-|avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|zlib1|libwinpthread-1)'
     # ymix talks over a Unix socket to reach Android's content:// documents. Windows has no such
     # restriction and no <sys/un.h>, so the protocol comes out for this target only.
     FF_OPTS="${FF_OPTS//--enable-protocol=file,pipe,ymix/--enable-protocol=file,pipe}"
@@ -143,6 +147,16 @@ PKG_CONFIG_PATH="$DEPS/lib/pkgconfig:$DEPS/lib64/pkgconfig${PKG_CONFIG_PATH:+:$P
   $FF_OPTS
 make -j"$JOBS"
 make install
+
+if [ -n "${WINDOWS:-}" ]; then
+  # ffmpeg --enable-zlib picks MinGW's shared zlib1.dll, and the per-DSO link stages pick MinGW's
+  # libwinpthread-1.dll (the -Bstatic sandwich in EXTRA_LDFLAGS gets reordered). Seed both into
+  # $PREFIX/bin so pack_ffmpeg_shared ships them (otherwise the pack has unsatisfied imports).
+  mingw_bin="$(dirname "$(command -v gcc)")"
+  for dll in zlib1.dll libwinpthread-1.dll; do
+    [ -f "$mingw_bin/$dll" ] && cp -a "$mingw_bin/$dll" "$PREFIX/bin/"
+  done
+fi
 
 PACK="$PREFIX/pack"
 pack_ffmpeg_shared "$PACK" "$PREFIX" "$BIN" "$ALLOWED_DEPS"

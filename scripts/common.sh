@@ -66,10 +66,12 @@ DEP_STD="-std=gnu17"
 assert_no_stray_deps() {
   local binary="$1" allowed="$2" listing="" od
   # Prefer ELF readers first: Android packs are built on macOS, where otool cannot
-  # parse NEEDED.
+  # parse NEEDED. The `|| true` keeps `pipefail` from aborting under `set -e` when
+  # readelf hits a PE binary (Windows): readelf -d returns non-zero on wrong magic,
+  # we want to fall through to objdump below instead of killing the whole script.
   for od in llvm-readelf readelf; do
     command -v "$od" >/dev/null || continue
-    listing="$("$od" -d "$binary" 2>/dev/null | awk '/NEEDED/ {print $NF}' | tr -d '[]')"
+    listing="$({ "$od" -d "$binary" 2>/dev/null || true; } | awk '/NEEDED/ {print $NF}' | tr -d '[]')"
     if [ -n "$listing" ]; then break; fi
   done
   if [ -z "$listing" ]; then
@@ -141,9 +143,13 @@ pack_ffmpeg_shared() {
   cp "$srcbin" "$pack/$binname"
   chmod +x "$pack/$binname"
   # Versioned SONAMEs + unversioned symlinks; Windows DLLs live in bin/ after make install.
+  # zlib1.dll + libwinpthread-1.dll are MinGW's shared libs that ffmpeg's --enable-zlib and
+  # per-DSO pthread link pick up on Windows; ship them next to ffmpeg.exe. Non-Windows prefixes
+  # don't have these in bin/ so the extra globs are a no-op there.
   local f
   for f in "$prefix/lib"/libav* "$prefix/lib"/libsw* "$prefix/bin"/av*.dll "$prefix/bin"/sw*.dll \
-           "$prefix/lib"/av*.dll "$prefix/lib"/sw*.dll; do
+           "$prefix/lib"/av*.dll "$prefix/lib"/sw*.dll \
+           "$prefix/bin"/zlib*.dll "$prefix/bin"/libwinpthread*.dll; do
     [ -e "$f" ] || continue
     case "$f" in *.a|*.pc|*.la) continue ;; esac
     cp -a "$f" "$pack/"
