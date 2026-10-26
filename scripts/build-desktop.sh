@@ -117,6 +117,13 @@ case "$(uname -s)" in
     install_hw_headers "$DEPS"
     FF_OPTS="$FF_OPTS $(video_hw_linux_ff_opts)"
     ;;
+  MINGW*|MSYS*|CLANG*|UCRT*)
+    # D3D11VA on Windows: the one cross-vendor (Intel/AMD/NVIDIA) hwaccel. Covers H.264 everywhere,
+    # VP9 on Gen9+/Vega+/Pascal+, AV1 on 11th-gen+/RDNA2+/Ampere+. Windows SDK headers are in MinGW
+    # already, so no extra deps. DXVA2 kept as a last-resort fallback for very old GPUs where D3D11
+    # device create fails.
+    FF_OPTS="$FF_OPTS --enable-d3d11va --enable-dxva2 --enable-hwaccel=h264_d3d11va,hevc_d3d11va,vp9_d3d11va,av1_d3d11va,h264_dxva2,hevc_dxva2,vp9_dxva2"
+    ;;
 esac
 
 # Install prefix: include/ + lib/ (shared libav) + bin/ffmpeg. pack/ is the relocatable flat
