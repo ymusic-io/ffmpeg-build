@@ -91,6 +91,7 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) LIBVPX_TARGET=arm64-darwin20-gcc ;;
   Linux-x86_64) LIBVPX_TARGET=x86_64-linux-gcc ;;
   Linux-aarch64|Linux-arm64) LIBVPX_TARGET=arm64-linux-gcc ;;
+  MINGW*-x86_64|MSYS*-x86_64|CLANG*-x86_64|UCRT*-x86_64) LIBVPX_TARGET=x86_64-win64-gcc ;;
   *) LIBVPX_TARGET=generic-gnu ;;
 esac
 export LIBVPX_TARGET
