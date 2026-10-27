@@ -37,7 +37,7 @@ case "$(uname -s)" in
     ALLOWED_DEPS='^(libc|libm|libdl|libpthread|librt|libz|libbz2|ld-linux|libav|libsw)'
     RPATH_LDFLAGS='-Wl,-rpath,\$ORIGIN'
     ;;
-  # uname -s names the MSYS2 environment: MINGW64 on x86_64, CLANGARM64 on arm64.
+  # Any MSYS2 environment: uname -s reads MINGW64_NT even under CLANGARM64.
   MINGW*|MSYS*|CLANG*|UCRT*)
     WINDOWS=1
     MIN_OS=""
@@ -95,9 +95,14 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) LIBVPX_TARGET=arm64-darwin20-gcc ;;
   Linux-x86_64) LIBVPX_TARGET=x86_64-linux-gcc ;;
   Linux-aarch64|Linux-arm64) LIBVPX_TARGET=arm64-linux-gcc ;;
-  # MSYS2's own runtime is x86_64 everywhere (emulated on ARM): only uname -s names the target.
-  MINGW64*|UCRT64*|CLANG64*) LIBVPX_TARGET=x86_64-win64-gcc ;;
-  CLANGARM64*) LIBVPX_TARGET=arm64-win64-gcc ;;
+  # Neither uname names the target on Windows ARM: MSYS2's runtime is x86_64 there, and uname -s
+  # reads MINGW64_NT under CLANGARM64 too. MSYSTEM_CARCH is the environment's own target.
+  MINGW*|MSYS*|CLANG*|UCRT*)
+    case "$MSYSTEM_CARCH" in
+      aarch64) LIBVPX_TARGET=arm64-win64-gcc ;;
+      *) LIBVPX_TARGET=x86_64-win64-gcc ;;
+    esac
+    ;;
   *) LIBVPX_TARGET=generic-gnu ;;
 esac
 export LIBVPX_TARGET
