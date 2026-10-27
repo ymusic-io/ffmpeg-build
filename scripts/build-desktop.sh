@@ -95,12 +95,15 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) LIBVPX_TARGET=arm64-darwin20-gcc ;;
   Linux-x86_64) LIBVPX_TARGET=x86_64-linux-gcc ;;
   Linux-aarch64|Linux-arm64) LIBVPX_TARGET=arm64-linux-gcc ;;
+  # MSYS2's own runtime is x86_64 everywhere (emulated on ARM): only uname -s names the target.
+  MINGW64*|UCRT64*|CLANG64*) LIBVPX_TARGET=x86_64-win64-gcc ;;
+  CLANGARM64*) LIBVPX_TARGET=arm64-win64-gcc ;;
   *) LIBVPX_TARGET=generic-gnu ;;
 esac
 export LIBVPX_TARGET
 build_dav1d "$DEPS" "$HOST_CC_BIN" "$DEP_CFLAGS" "$HOST_AR_BIN"
 build_libvpx "$DEPS" "$HOST_CC_BIN" "$DEP_CFLAGS" "$HOST_AR_BIN"
-if [ "$(uname -m)" = x86_64 ]; then
+if [[ $LIBVPX_TARGET == x86_64-* ]]; then
   # grep -q + pipefail dies on nm's SIGPIPE; size is the portable SIMD check
   # (generic-gnu decode-only is ~400 KB).
   vpx_n=$(wc -c < "$DEPS/lib/libvpx.a")
@@ -128,7 +131,8 @@ esac
 
 # Install prefix: include/ + lib/ (shared libav) + bin/ffmpeg. pack/ is the relocatable flat
 # set YMusic ships (CLI + the same DSOs MSE loads).
-ARCH_SLUG="$(uname -m)"
+# MSYSTEM_CARCH: the MSYS2 environment's target (aarch64 on CLANGARM64), where uname -m says x86_64.
+ARCH_SLUG="${MSYSTEM_CARCH:-$(uname -m)}"
 case "$ARCH_SLUG" in arm64|aarch64) ARCH_SLUG=arm64 ;; x86_64|amd64) ARCH_SLUG=x86_64 ;; esac
 case "$(uname -s)" in
   Darwin) SLUG="macos-$ARCH_SLUG" ;;
