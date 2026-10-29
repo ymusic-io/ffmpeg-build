@@ -33,6 +33,9 @@ case "$(uname -s)" in
     ;;
   Linux)
     MIN_OS=""
+    # The static deps end up inside the shared libavcodec.so. Without -fPIC a PIE-default gcc
+    # (Ubuntu 24.04) emits copy relocations there, and the libavcodec link fails.
+    DEP_PIC="-fPIC"
     LD_STRIP="-Wl,--gc-sections"
     ALLOWED_DEPS='^(libc|libm|libdl|libpthread|librt|libz|libbz2|ld-linux|libav|libsw)'
     RPATH_LDFLAGS='-Wl,-rpath,\$ORIGIN'
@@ -65,7 +68,7 @@ case "$(uname -s)" in
 esac
 BIN="${BIN:-ffmpeg}"
 
-DEP_CFLAGS="$DEP_STD $FF_OPTFLAGS $FF_SIZE_CFLAGS $MIN_OS"
+DEP_CFLAGS="$DEP_STD $FF_OPTFLAGS $FF_SIZE_CFLAGS $MIN_OS ${DEP_PIC:-}"
 
 # Build a vendored autotools dependency in a disposable copy, so src/ stays pristine while still
 # building in-tree (shine's CLI includes a sibling header by relative path and breaks under VPATH).
