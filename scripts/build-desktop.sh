@@ -54,11 +54,10 @@ case "$(uname -s)" in
     EXTRA_LDFLAGS="-static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
     EXTRA_CONF="--target-os=mingw64 --host-os=mingw64"
     # Case-insensitively matched; OS DLLs plus our libav/libsw.
-    # zlib1 is MinGW's shared zlib (ffmpeg --enable-zlib picks it up); ship it beside ffmpeg.exe.
-    # libwinpthread-1 similarly — ffmpeg's own `--extra-ldflags "-Bstatic -lwinpthread -Bdynamic"`
-    # sandwich doesn't survive ffmpeg's internal reordering for the per-lib .so links, so each DSO
+    # libwinpthread-1 is MinGW's shared pthread: ffmpeg's own
+    # `--extra-ldflags "-Bstatic -lwinpthread -Bdynamic"` sandwich doesn't survive ffmpeg's internal reordering for the per-lib .so links, so each DSO
     # ends up linking the shared one; ship it too.
-    ALLOWED_DEPS='^(kernel32|user32|advapi32|ws2_32|shell32|ole32|oleaut32|secur32|bcrypt|ncrypt|crypt32|gdi32|imm32|version|psapi|iphlpapi|winmm|shlwapi|msvcrt|ucrtbase|api-ms-|avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|zlib1|libwinpthread-1)'
+    ALLOWED_DEPS='^(kernel32|user32|advapi32|ws2_32|shell32|ole32|oleaut32|secur32|bcrypt|ncrypt|crypt32|gdi32|imm32|version|psapi|iphlpapi|winmm|shlwapi|msvcrt|ucrtbase|api-ms-|avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|libwinpthread-1)'
     # ymix talks over a Unix socket to reach Android's content:// documents. Windows has no such
     # restriction and no <sys/un.h>, so the protocol comes out for this target only.
     FF_OPTS="${FF_OPTS//--enable-protocol=file,pipe,ymix/--enable-protocol=file,pipe}"
@@ -89,6 +88,13 @@ apply_ymix_patch
 
 [ -f "$DEPS/lib/libmp3lame.a" ] || { echo "[deps] lame";  build_dep "$SRC/lame/lame" lame --disable-frontend --disable-gtktest; }
 [ -f "$DEPS/lib/libshine.a" ]   || { echo "[deps] shine"; bootstrap_shine; build_dep "$SRC/shine" shine; fix_shine_pc "$DEPS"; }
+if [ -n "${WINDOWS:-}" ]; then
+  # zlib1.dll must not ship (an unsigned DLL under that name gets quarantined by antivirus). GNU ld
+  # and lld both take libz.dll.a over libz.a from the same dir, so a lone libz.a in the first -L dir
+  # is what makes -lz static in every link, including the per-DSO ones that reorder -Bstatic.
+  mkdir -p "$DEPS/lib"
+  cp "${MINGW_PREFIX:?not an MSYS2 shell}/lib/libz.a" "$DEPS/lib/"
+fi
 
 fetch_video_srcs
 HOST_CC_BIN="${CC:-$(command -v clang || command -v cc)}"
@@ -168,13 +174,11 @@ make -j"$JOBS"
 make install
 
 if [ -n "${WINDOWS:-}" ]; then
-  # ffmpeg --enable-zlib picks MinGW's shared zlib1.dll, and the per-DSO link stages pick MinGW's
-  # libwinpthread-1.dll (the -Bstatic sandwich in EXTRA_LDFLAGS gets reordered). Seed both into
-  # $PREFIX/bin so pack_ffmpeg_shared ships them (otherwise the pack has unsatisfied imports).
+  # The per-DSO link stages pick MinGW's libwinpthread-1.dll (the -Bstatic sandwich in
+  # EXTRA_LDFLAGS gets reordered). Seed it into $PREFIX/bin so pack_ffmpeg_shared ships it
+  # (otherwise the pack has an unsatisfied import).
   mingw_bin="$(dirname "$(command -v gcc)")"
-  for dll in zlib1.dll libwinpthread-1.dll; do
-    [ -f "$mingw_bin/$dll" ] && cp -a "$mingw_bin/$dll" "$PREFIX/bin/"
-  done
+  [ -f "$mingw_bin/libwinpthread-1.dll" ] && cp -a "$mingw_bin/libwinpthread-1.dll" "$PREFIX/bin/"
 fi
 
 PACK="$PREFIX/pack"

@@ -143,13 +143,12 @@ pack_ffmpeg_shared() {
   cp "$srcbin" "$pack/$binname"
   chmod +x "$pack/$binname"
   # Versioned SONAMEs + unversioned symlinks; Windows DLLs live in bin/ after make install.
-  # zlib1.dll + libwinpthread-1.dll are MinGW's shared libs that ffmpeg's --enable-zlib and
-  # per-DSO pthread link pick up on Windows; ship them next to ffmpeg.exe. Non-Windows prefixes
-  # don't have these in bin/ so the extra globs are a no-op there.
+  # libwinpthread-1.dll is MinGW's shared pthread that the per-DSO links pick up on Windows; ship
+  # it next to ffmpeg.exe. Non-Windows prefixes don't have it in bin/, so that glob is a no-op there.
   local f
   for f in "$prefix/lib"/libav* "$prefix/lib"/libsw* "$prefix/bin"/av*.dll "$prefix/bin"/sw*.dll \
            "$prefix/lib"/av*.dll "$prefix/lib"/sw*.dll \
-           "$prefix/bin"/zlib*.dll "$prefix/bin"/libwinpthread*.dll; do
+           "$prefix/bin"/libwinpthread*.dll; do
     [ -e "$f" ] || continue
     case "$f" in *.a|*.pc|*.la) continue ;; esac
     cp -a "$f" "$pack/"
